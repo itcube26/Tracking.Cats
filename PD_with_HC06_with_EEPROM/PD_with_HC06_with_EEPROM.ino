@@ -10,13 +10,13 @@
 #include <EEPROM.h>
 
 // ========== НАСТРОЙКИ ==========
-float Kp = 0.01;
-float Kd = 0.008;
+float Kp = 0.026;
+float Kd = 0.015;
 
-#define rightMaxSpeed 150
-#define leftMaxSpeed 150
-int rightBaseSpeed = 50;
-int leftBaseSpeed = 50;
+#define rightMaxSpeed 200
+#define leftMaxSpeed 200
+int rightBaseSpeed = 85;
+int leftBaseSpeed = 85;
 
 #define SensorCount 8
 #define EMITTER_PIN 2

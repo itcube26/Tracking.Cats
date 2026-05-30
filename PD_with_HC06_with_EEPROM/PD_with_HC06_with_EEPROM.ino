@@ -1,10 +1,10 @@
-#define PWMA 6
-#define PWMB 5
-#define AIN1 7
-#define AIN2 8
+#define PWMA 5
+#define PWMB 6
+
+#define AIN1 8
+#define AIN2 7
 #define BIN1 10
-#define BIN2 11
-#define STBY 9
+#define BIN2 9
 #define BTN_PIN 3  // Кнопка: D3 ↔ GND
 
 #include <QTRSensors.h>
@@ -12,12 +12,10 @@
 
 // ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 float Kp = 0.01;
-float Ki = 0.00; // Интегральный коэффициент
 float Kd = 0.008;
 int lastError = 0;
-float integral = 0.0; // Накопленная ошибка
 
-// Скорости
+// Скорости — теперь переменные, а не #define (чтобы менять на лету)
 int rightMaxSpeed = 150;
 int leftMaxSpeed = 150;
 int rightBaseSpeed = 50;
@@ -43,7 +41,6 @@ const byte EEPROM_MAGIC = 0xA5;
 struct EepromConfig {
     byte magic;
     float kp;
-    float ki;
     float kd;
     int leftBase;
     int rightBase;
@@ -55,7 +52,6 @@ void loadFromEEPROM() {
     EEPROM.get(0, eepromConfig);
     if (eepromConfig.magic == EEPROM_MAGIC) {
         Kp = eepromConfig.kp;
-        Ki = eepromConfig.ki;
         Kd = eepromConfig.kd;
         leftBaseSpeed = eepromConfig.leftBase;
         rightBaseSpeed = eepromConfig.rightBase;
@@ -70,7 +66,6 @@ void loadFromEEPROM() {
 void saveToEEPROM() {
     eepromConfig.magic = EEPROM_MAGIC;
     eepromConfig.kp = Kp;
-    eepromConfig.ki = Ki;
     eepromConfig.kd = Kd;
     eepromConfig.leftBase = leftBaseSpeed;
     eepromConfig.rightBase = rightBaseSpeed;
@@ -82,7 +77,7 @@ void saveToEEPROM() {
 
 void factoryResetEEPROM() {
     EEPROM.update(0, 0x00);
-    Kp = 0.01; Ki = 0.00; Kd = 0.008; 
+    Kp = 0.01; Kd = 0.008; 
     leftBaseSpeed = 50; rightBaseSpeed = 50;
     leftMaxSpeed = 150; rightMaxSpeed = 150;
     sendBT(F("🔄 Сброс. Перезагрузите Arduino.\n"));
@@ -96,6 +91,7 @@ const unsigned long BTN_DEBOUNCE = 200;
 
 void handleButton() {
     bool currentBtnState = digitalRead(BTN_PIN);
+    
     if (currentBtnState == LOW && lastBtnState == HIGH && (millis() - lastToggleTime) > BTN_DEBOUNCE) {
         lastToggleTime = millis();
         toggleRobotState();
@@ -105,22 +101,19 @@ void handleButton() {
 
 void toggleRobotState() {
     isRunning = !isRunning;
+    
     if (isRunning) {
         lastError = 0;
-        integral = 0.0; // Сброс интеграла при старте
         sendBT(F("▶ START\n"));
     } else {
         analogWrite(PWMA, 0);
         analogWrite(PWMB, 0);
-        integral = 0.0; // Сброс интеграла при остановке
         sendBT(F("⏹ STOP\n"));
     }
 }
 // ===========================
 
 void setup(){
-  pinMode(STBY, OUTPUT);
-  digitalWrite(STBY, HIGH);
   pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
@@ -165,17 +158,13 @@ void loop()
   digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
 
   uint16_t position = qtr.readLineBlack(sensorValues);
+  Serial.println(position);
   int error = position - 3500;
   
-  // === PID РАСЧЁТ ===
-  integral += error;
-  // Anti-windup: ограничиваем накопление, чтобы интеграл не "уносил" моторы в насыщение
-  if (integral > 3000) integral = 3000;
-  if (integral < -3000) integral = -3000;
-
-  int motorSpeed = (Kp * error) + (Ki * integral) + (Kd * (error - lastError));
+  int motorSpeed = Kp * error + Kd * (error - lastError);
   lastError = error;
 
+  // Применяем ограничения через maxSpeed
   int rightMotorSpeed = constrain(rightBaseSpeed + motorSpeed, 0, rightMaxSpeed);
   int leftMotorSpeed  = constrain(leftBaseSpeed - motorSpeed, 0, leftMaxSpeed);
   
@@ -222,12 +211,14 @@ void handleBluetoothCommands() {
 void parseCommand(char* cmd) {
   while (*cmd == ' ') cmd++;
   
+  // ▶ START
   if (strcmp(cmd, "start") == 0) {
     if (!isRunning) toggleRobotState();
     else sendBT(F("⚠ Уже работает!\n"));
     return;
   }
   
+  // ⏹ STOP
   if (strcmp(cmd, "stop") == 0) {
     if (isRunning) toggleRobotState();
     else sendBT(F("⚠ Уже остановлен!\n"));
@@ -242,19 +233,6 @@ void parseCommand(char* cmd) {
     return;
   }
   
-  // 🆕 KI
-  if (strncmp(cmd, "ki:", 3) == 0) {
-    float val = atof(cmd + 3);
-    if (val >= 0 && val <= 0.5) {
-      Ki = val;
-      integral = 0.0; // Сброс интеграла при смене коэффициента
-      saveToEEPROM();
-      sendBT(F("✅ Ki=")); sendBT(String(Ki, 4) + "\n");
-      printParams();
-    } else sendBT(F("❌ Ki range: 0.0...0.5\n"));
-    return;
-  }
-
   // KD
   if (strncmp(cmd, "kd:", 3) == 0) {
     float val = atof(cmd + 3);
@@ -263,7 +241,7 @@ void parseCommand(char* cmd) {
     return;
   }
 
-  // BASE
+  // BASE: базовая скорость
   if (strncmp(cmd, "base:", 5) == 0) {
     int l = atoi(cmd + 5);
     char* comma = strchr(cmd + 5, ',');
@@ -279,7 +257,7 @@ void parseCommand(char* cmd) {
     return;
   }
 
-  // MAX
+  // 🆕 MAX: максимальная скорость
   if (strncmp(cmd, "max:", 4) == 0) {
     int l = atoi(cmd + 4);
     char* comma = strchr(cmd + 4, ',');
@@ -309,16 +287,15 @@ void parseCommand(char* cmd) {
   if (strcmp(cmd, "help") == 0) {
     sendBT(F("\n📋 Commands:\n"));
     sendBT(F("start/stop     — управление (BT или кнопка D3)\n"));
-    sendBT(F("kp:<val>       — Proportional (0.0-1.0)\n"));
-    sendBT(F("ki:<val>       — Integral     (0.0-0.5)\n"));
-    sendBT(F("kd:<val>       — Derivative   (0.0-1.0)\n"));
-    sendBT(F("base:L,R       — базовая скорость\n"));
-    sendBT(F("max:L,R        — максимальная скорость\n"));
+    sendBT(F("kp:<val>       — P коэффициент (0.0-1.0)\n"));
+    sendBT(F("kd:<val>       — D коэффициент (0.0-1.0)\n"));
+    sendBT(F("base:L,R       — базовая скорость (0-255)\n"));
+    sendBT(F("max:L,R        — максимальная скорость (0-255)\n"));
     sendBT(F("telemetry:on/off — поток данных\n"));
-    sendBT(F("save           — в EEPROM\n"));
+    sendBT(F("save           — принудительно в EEPROM\n"));
     sendBT(F("reset          — сброс настроек\n"));
     sendBT(F("params         — показать текущие\n"));
-    sendBT(F("help           — справка\n"));
+    sendBT(F("help           — эта справка\n"));
     return;
   }
   
@@ -327,7 +304,6 @@ void parseCommand(char* cmd) {
 
 void printParams() {
   sendBT(F("⚙ Kp=")); sendBT(String(Kp, 4));
-  sendBT(F(" | Ki=")); sendBT(String(Ki, 4));
   sendBT(F(" | Kd=")); sendBT(String(Kd, 4));
   sendBT(F(" | Base L=")); sendBT(String(leftBaseSpeed));
   sendBT(F(" R=")); sendBT(String(rightBaseSpeed));

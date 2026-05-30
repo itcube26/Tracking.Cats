@@ -5,18 +5,21 @@
 #define BIN1 10
 #define BIN2 11
 #define STBY 9
+#define BTN_PIN 3  // Кнопка: один контакт на D3, второй на GND
 
 #include <QTRSensors.h>
 #include <EEPROM.h>
 
 // ========== НАСТРОЙКИ ==========
-float Kp = 0.026;
-float Kd = 0.015;
+float Kp = 0.01;
+float Kd = 0.008;
 
-#define rightMaxSpeed 200
-#define leftMaxSpeed 200
-int rightBaseSpeed = 85;
-int leftBaseSpeed = 85;
+int lastError = 0;
+
+#define rightMaxSpeed 150
+#define leftMaxSpeed 150
+int rightBaseSpeed = 50;
+int leftBaseSpeed = 50;
 
 #define SensorCount 8
 #define EMITTER_PIN 2
@@ -27,15 +30,14 @@ bool isRunning = false;
 QTRSensors qtr;
 uint16_t sensorValues[SensorCount];
 
-// Буфер для команд
+// Буфер для Bluetooth-команд
 #define CMD_BUFFER_SIZE 32
 char cmdBuffer[CMD_BUFFER_SIZE];
 uint8_t cmdIndex = 0;
 
-// Телеметрия
 bool telemetryEnabled = false;
 
-// ========== EEPROM СТРУКТУРА ==========
+// ========== EEPROM ==========
 const byte EEPROM_MAGIC = 0xA5;
 struct EepromConfig {
     byte magic;
@@ -54,7 +56,7 @@ void loadFromEEPROM() {
         rightBaseSpeed = eepromConfig.rightBase;
         sendBT(F("📂 Загружено из EEPROM\n"));
     } else {
-        sendBT(F("📦 Первая загрузка. Используются дефолты.\n"));
+        sendBT(F("📦 Первая загрузка. Дефолтные параметры.\n"));
     }
 }
 
@@ -69,12 +71,38 @@ void saveToEEPROM() {
 }
 
 void factoryResetEEPROM() {
-    // Записываем неверный магический байт, чтобы сбросить настройки
     EEPROM.update(0, 0x00);
     Kp = 0.01; Kd = 0.008; leftBaseSpeed = 50; rightBaseSpeed = 50;
-    sendBT(F("🔄 Сброс настроек. Перезагрузите Arduino.\n"));
+    sendBT(F("🔄 Сброс. Перезагрузите Arduino.\n"));
 }
-// ======================================
+// ============================
+
+// ========== КНОПКА ==========
+bool lastBtnState = HIGH;
+unsigned long lastToggleTime = 0;
+const unsigned long BTN_DEBOUNCE = 200; // мс между нажатиями
+
+void handleButton() {
+    bool currentBtnState = digitalRead(BTN_PIN);
+    
+    // Детекция нажатия (HIGH -> LOW) с защитой от дребезга
+    if (currentBtnState == LOW && lastBtnState == HIGH && (millis() - lastToggleTime) > BTN_DEBOUNCE) {
+        lastToggleTime = millis();
+        isRunning = !isRunning;
+        
+        if (isRunning) {
+            lastError = 0; // Плавный старт
+            delay(500);
+            sendBT(F("▶ START (Button)\n"));
+        } else {
+            analogWrite(PWMA, 0);
+            analogWrite(PWMB, 0);
+            sendBT(F("⏹ STOP (Button)\n"));
+        }
+    }
+    lastBtnState = currentBtnState;
+}
+// ===========================
 
 void setup(){
   pinMode(STBY, OUTPUT);
@@ -82,6 +110,9 @@ void setup(){
   pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  
+  // Кнопка с внутренней подтяжкой (HIGH когда отпущена, LOW когда нажата)
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
   qtr.setTypeAnalog();
   qtr.setSensorPins((const uint8_t[]){A7, A6, A5, A4, A3, A2, A1, A0}, SensorCount);
@@ -90,20 +121,19 @@ void setup(){
   Serial.begin(9600);
   delay(1000);
 
-  // Загружаем сохранённые параметры
   loadFromEEPROM();
 
   // Калибровка
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
-  sendBT(F("🔄 Калибровка...\n"));
+  sendBT(F("🔄 Калибровка... (проведите над линией)\n"));
   for (uint16_t i = 0; i < 400; i++) qtr.calibrate();
   digitalWrite(LED_BUILTIN, LOW);
 
-  sendBT(F("✅ Готово. Робот стоит.\n"));
-  sendBT(F("Type 'help' for commands\n"));
+  sendBT(F("✅ Калибровка завершена.\n"));
+  sendBT(F("⏹ Робот стоит. Нажмите кнопку на D3 для старта.\n"));
   
-  // Гарантируем остановку
+  // Гарантированная остановка
   analogWrite(PWMA, 0);
   analogWrite(PWMB, 0);
   isRunning = false;
@@ -111,18 +141,19 @@ void setup(){
   printParams();
 }
 
-int lastError = 0;
+
 
 void loop()
 {
   handleBluetoothCommands();
+  handleButton(); // Обработка физической кнопки
 
   if (!isRunning) {
     delay(20);
     return;
   }
 
-  // Движение
+  // Движение по линии
   digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
   digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
 
@@ -153,7 +184,7 @@ void loop()
 }
 
 // ============================================================================
-// 📡 ОБРАБОТКА КОМАНД
+// 📡 BLUETOOTH КОМАНДЫ
 // ============================================================================
 
 void sendBT(const __FlashStringHelper* str) { Serial.print(str); }
@@ -182,36 +213,12 @@ void handleBluetoothCommands() {
 void parseCommand(char* cmd) {
   while (*cmd == ' ') cmd++;
   
-  // ▶ START
-  if (strcmp(cmd, "start") == 0) {
-    if (isRunning) sendBT(F("⚠ Уже работает!\n"));
-    else {
-      isRunning = true;
-      lastError = 0;
-      sendBT(F("▶ START\n"));
-    }
-    return;
-  }
-  
-  // ⏹ STOP
-  if (strcmp(cmd, "stop") == 0) {
-    if (!isRunning) sendBT(F("⚠ Уже остановлен!\n"));
-    else {
-      isRunning = false;
-      analogWrite(PWMA, 0); analogWrite(PWMB, 0);
-      sendBT(F("⏹ STOP\n"));
-    }
-    return;
-  }
-  
   // KP
   if (strncmp(cmd, "kp:", 3) == 0) {
     float val = atof(cmd + 3);
     if (val >= 0 && val <= 1.0) {
-      Kp = val;
-      saveToEEPROM();
-      sendBT(F("✅ Kp=")); sendBT(String(Kp, 4) + "\n");
-      printParams();
+      Kp = val; saveToEEPROM();
+      sendBT(F("✅ Kp=")); sendBT(String(Kp, 4) + "\n"); printParams();
     } else sendBT(F("❌ Kp range: 0.0...1.0\n"));
     return;
   }
@@ -220,10 +227,8 @@ void parseCommand(char* cmd) {
   if (strncmp(cmd, "kd:", 3) == 0) {
     float val = atof(cmd + 3);
     if (val >= 0 && val <= 1.0) {
-      Kd = val;
-      saveToEEPROM();
-      sendBT(F("✅ Kd=")); sendBT(String(Kd, 4) + "\n");
-      printParams();
+      Kd = val; saveToEEPROM();
+      sendBT(F("✅ Kd=")); sendBT(String(Kd, 4) + "\n"); printParams();
     } else sendBT(F("❌ Kd range: 0.0...1.0\n"));
     return;
   }
@@ -244,35 +249,28 @@ void parseCommand(char* cmd) {
     return;
   }
   
-  // PARAMS
   if (strcmp(cmd, "params") == 0) { printParams(); return; }
-
-  // TELEMETRY
+  
   if (strncmp(cmd, "telemetry:", 10) == 0) {
     if (strcmp(cmd + 10, "on") == 0) { telemetryEnabled = true; sendBT(F("✅ Telemetry: ON\n")); }
     else if (strcmp(cmd + 10, "off") == 0) { telemetryEnabled = false; sendBT(F("✅ Telemetry: OFF\n")); }
     return;
   }
 
-  // 💾 SAVE (принудительное сохранение, если нужно)
   if (strcmp(cmd, "save") == 0) { saveToEEPROM(); return; }
-
-  // 🔄 RESET (сброс к заводским настройкам)
   if (strcmp(cmd, "reset") == 0) { factoryResetEEPROM(); return; }
   
-  // HELP
   if (strcmp(cmd, "help") == 0) {
     sendBT(F("\n📋 Commands:\n"));
-    sendBT(F("start          — поехать\n"));
-    sendBT(F("stop           — остановиться\n"));
     sendBT(F("kp:<val>       — P (0.0-1.0)\n"));
     sendBT(F("kd:<val>       — D (0.0-1.0)\n"));
     sendBT(F("base:L,R       — скорость (0-255)\n"));
     sendBT(F("telemetry:on/off — данные\n"));
-    sendBT(F("save           — сохранить в EEPROM\n"));
+    sendBT(F("save           — принудительно в EEPROM\n"));
     sendBT(F("reset          — сброс настроек\n"));
     sendBT(F("params         — показать настройки\n"));
     sendBT(F("help           — справка\n"));
+    sendBT(F("\n⚠️ Start/Stop: Физическая кнопка на D3-GND\n"));
     return;
   }
   
